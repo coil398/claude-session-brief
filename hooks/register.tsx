@@ -65,8 +65,26 @@ type MainTurn = {
 }
 
 type IsCurrentSession = () => boolean
+type AgentLifecycle = { id: string; type?: string; description?: string; status?: string }
 
 type ClassicObservedResult = ClassicResultOf[ClassicEventName]
+
+function recordAgentEvidence(
+  id: string,
+  excludedAgentIds: Set<string>,
+  confirmedAgentIds: Set<string>,
+): void {
+  confirmedAgentIds.add(id)
+  excludedAgentIds.delete(id)
+}
+
+function isExcludedAgent(
+  id: string,
+  excludedAgentIds: ReadonlySet<string>,
+  confirmedAgentIds: ReadonlySet<string>,
+): boolean {
+  return excludedAgentIds.has(id) && !confirmedAgentIds.has(id)
+}
 
 function safeDebug($: EngineInterface, message: string): void {
   try {
@@ -127,23 +145,85 @@ async function refreshHookConfiguration(
 async function refreshAgents(
   $: EngineInterface,
   isCurrent: IsCurrentSession,
-  lifecycle?: { id: string; type?: string; description?: string; status?: string },
+  lifecycle: AgentLifecycle | undefined,
+  excludedAgentIds: ReadonlySet<string>,
+  confirmedAgentIds: ReadonlySet<string>,
 ): Promise<void> {
   if (!isCurrent()) return
-  let listed: readonly AgentInfo[]
+  let listed: readonly AgentInfo[] = []
+  let listAvailable = true
   try {
     listed = await $.agent.list()
   } catch (error) {
+    listAvailable = false
     safeDebug($, `could not read subagent list: ${String(error)}`)
-    return
   }
   if (!isCurrent()) return
   const now = await safeNow($)
   if (now === undefined || !isCurrent()) return
-  await updateIfCurrent($, isCurrent, state => ({
-    ...state,
-    agents: mergeAgents(state.agents, listed, now, lifecycle),
-  }))
+  await updateIfCurrent($, isCurrent, state => {
+    const current = state.agents.filter(agent =>
+      !isExcludedAgent(agent.id, excludedAgentIds, confirmedAgentIds),
+    )
+    const activeLifecycle = lifecycle &&
+      !isExcludedAgent(lifecycle.id, excludedAgentIds, confirmedAgentIds)
+      ? lifecycle
+      : undefined
+    if (!listAvailable && !activeLifecycle) {
+      return current.length === state.agents.length ? state : { ...state, agents: current }
+    }
+    return {
+      ...state,
+      agents: mergeAgents(
+        current,
+        listAvailable
+          ? listed.filter(agent =>
+            !isExcludedAgent(agent.id, excludedAgentIds, confirmedAgentIds),
+          )
+          : [],
+        now,
+        activeLifecycle,
+      ),
+    }
+  })
+}
+
+async function captureAgentIds(
+  $: EngineInterface,
+  phase: 'before' | 'after',
+): Promise<Set<string> | undefined> {
+  try {
+    return new Set((await $.agent.list()).map(agent => agent.id))
+  } catch (error) {
+    safeDebug($, `could not capture agent IDs ${phase} summary completion: ${String(error)}`)
+    return undefined
+  }
+}
+
+async function excludeAgentsCreatedBySummary(
+  $: EngineInterface,
+  isCurrent: IsCurrentSession,
+  before: ReadonlySet<string> | undefined,
+  excludedAgentIds: Set<string>,
+  confirmedAgentIds: ReadonlySet<string>,
+): Promise<void> {
+  const after = await captureAgentIds($, 'after')
+  if (!isCurrent() || before === undefined || after === undefined) return
+  const added = new Set([...after].filter(id =>
+    !before.has(id) && !confirmedAgentIds.has(id),
+  ))
+  if (added.size === 0) return
+  for (const id of added) excludedAgentIds.add(id)
+  try {
+    await updateIfCurrent($, isCurrent, state => {
+      const agents = state.agents.filter(agent =>
+        !added.has(agent.id) || confirmedAgentIds.has(agent.id),
+      )
+      return agents.length === state.agents.length ? state : { ...state, agents }
+    })
+  } catch (error) {
+    safeDebug($, `could not remove summary-created agents from the brief: ${String(error)}`)
+  }
 }
 
 function formatToolActivity(event: unknown): string {
@@ -261,22 +341,24 @@ async function recordClassicActivity(
 function lifecycleFromClassicEvent(
   event: string,
   input: unknown,
-): { id: string; type?: string; status?: string } | undefined {
+): AgentLifecycle | undefined {
   if (typeof input !== 'object' || input === null) return undefined
   const value = input as Record<string, unknown>
   const id = typeof value.agent_id === 'string' ? value.agent_id : undefined
-  if (!id) return undefined
+  const type = typeof value.agent_type === 'string' ? value.agent_type : undefined
+  if (!id || type === undefined) return undefined
   if (event === 'SubagentStart') {
     return {
       id,
-      type: typeof value.agent_type === 'string' ? value.agent_type : undefined,
+      type,
       status: 'running',
     }
   }
   if (event === 'SubagentStop') {
     return {
       id,
-      type: typeof value.agent_type === 'string' ? value.agent_type : undefined,
+      type,
+      status: 'completed',
     }
   }
   return undefined
@@ -286,6 +368,8 @@ async function summarizeTurn(
   $: EngineInterface,
   snapshot: SummarySnapshot,
   isCurrent: () => boolean,
+  excludedAgentIds: Set<string>,
+  confirmedAgentIds: Set<string>,
 ): Promise<void> {
   if (!isCurrent()) return
   const surfaces = await $.session.surfaces()
@@ -309,13 +393,25 @@ async function summarizeTurn(
   if (!isCurrent()) return
 
   try {
-    const result = await $.model.complete({
-      model: 'haiku',
-      prompt,
-      effort: 'low',
-      maxTokens: 1000,
-      timeoutMs: 12000,
-    })
+    const beforeAgentIds = await captureAgentIds($, 'before')
+    let result: Awaited<ReturnType<EngineInterface['model']['complete']>>
+    try {
+      result = await $.model.complete({
+        model: 'haiku',
+        prompt,
+        effort: 'low',
+        maxTokens: 1000,
+        timeoutMs: 12000,
+      })
+    } finally {
+      await excludeAgentsCreatedBySummary(
+        $,
+        isCurrent,
+        beforeAgentIds,
+        excludedAgentIds,
+        confirmedAgentIds,
+      )
+    }
     if (!isCurrent()) return
 
     await updateIfCurrent($, isCurrent, current => ({
@@ -1075,6 +1171,8 @@ export const register: Register = on => {
   let activeMainTurnId: string | undefined
   const mainTurns = new Map<string, MainTurn>()
   const summaryQueue = createSerialLatestQueue<SummarySnapshot>()
+  const excludedAgentIds = new Set<string>()
+  const confirmedAgentIds = new Set<string>()
   const codexMonitor: CodexMonitorState = {
     nextPollToken: 0,
     ensureRevision: 0,
@@ -1096,7 +1194,7 @@ export const register: Register = on => {
     const started = await next(e)
     scheduleBackground($, 'session setup', async () => {
       await refreshHookConfiguration($, isCurrent)
-      await refreshAgents($, isCurrent)
+      await refreshAgents($, isCurrent, undefined, excludedAgentIds, confirmedAgentIds)
       await ensureCodexMonitor($, isCurrent, codexMonitor)
     })
     return started
@@ -1319,13 +1417,14 @@ export const register: Register = on => {
     const generation = sessionGeneration
     const isCurrent = () => generation === sessionGeneration
     const result = await next(e)
-    if (result.agentId !== undefined && isCurrent()) {
+    if (typeof result.agentId === 'string' && isCurrent()) {
+      recordAgentEvidence(result.agentId, excludedAgentIds, confirmedAgentIds)
       scheduleBackground($, 'subagent refresh', async () => {
         await refreshAgents($, isCurrent, {
           id: result.agentId!,
           type: e.subagentType,
           description: e.description,
-        })
+        }, excludedAgentIds, confirmedAgentIds)
       })
     }
     return result
@@ -1334,11 +1433,20 @@ export const register: Register = on => {
   on('turn.complete', ($, e, next) => {
     const generation = sessionGeneration
     const isCurrentSession = () => generation === sessionGeneration
+    if (typeof e.agentId === 'string') {
+      recordAgentEvidence(e.agentId, excludedAgentIds, confirmedAgentIds)
+    }
     const result = next(e)
-    if (e.agentId !== undefined) {
+    if (typeof e.agentId === 'string') {
       const status = e.reason === 'answer' ? 'completed' : e.reason === 'aborted' ? 'killed' : 'failed'
       scheduleBackground($, 'subagent completion refresh', async () => {
-        await refreshAgents($, isCurrentSession, { id: e.agentId!, status })
+        await refreshAgents(
+          $,
+          isCurrentSession,
+          { id: e.agentId!, status },
+          excludedAgentIds,
+          confirmedAgentIds,
+        )
       })
       return result
     }
@@ -1372,7 +1480,13 @@ export const register: Register = on => {
           return () => timer.cancel()
         },
         run: (value, isCurrentQueueTask) =>
-          summarizeTurn($, value, () => isCurrentSession() && isCurrentQueueTask()),
+          summarizeTurn(
+            $,
+            value,
+            () => isCurrentSession() && isCurrentQueueTask(),
+            excludedAgentIds,
+            confirmedAgentIds,
+          ),
         onError: error => safeDebug($, `summary queue failed: ${String(error)}`),
       })
     })
@@ -1383,6 +1497,8 @@ export const register: Register = on => {
     const generation = sessionGeneration
     const isCurrent = () => generation === sessionGeneration
     const event = next.event.slice('classic.'.length)
+    const lifecycle = lifecycleFromClassicEvent(event, e)
+    if (lifecycle) recordAgentEvidence(lifecycle.id, excludedAgentIds, confirmedAgentIds)
     const hasTaskSnapshot = (event === 'Stop' || event === 'SubagentStop') &&
       hasBackgroundTaskSnapshot(e)
     const snapshotSequence = hasTaskSnapshot ? ++backgroundTaskSequence : backgroundTaskSequence
@@ -1403,8 +1519,9 @@ export const register: Register = on => {
       if (event === 'ConfigChange') {
         await refreshHookConfiguration($, isCurrent)
       }
-      const lifecycle = lifecycleFromClassicEvent(event, e)
-      if (lifecycle) await refreshAgents($, isCurrent, lifecycle)
+      if (lifecycle) {
+        await refreshAgents($, isCurrent, lifecycle, excludedAgentIds, confirmedAgentIds)
+      }
       if (!hasTaskSnapshot || !isCurrent()) return
 
       const now = await safeNow($)
@@ -1450,6 +1567,8 @@ export const register: Register = on => {
     const result = next(e)
     if (e.reason === 'clear' || e.reason === 'resume') {
       sessionGeneration += 1
+      excludedAgentIds.clear()
+      confirmedAgentIds.clear()
       cancelCodexMonitor(codexMonitor)
       summaryQueue.reset()
       mainTurnNumber = 0
@@ -1521,7 +1640,7 @@ export const register: Register = on => {
           </Text>
           <Button
             key="open-details"
-            label="詳細"
+            label=" · 詳細"
             plain
             onPress={async () => {
               try {

@@ -2,6 +2,7 @@ import type { AgentInfo, HookFor, ModelCompleteResult, On, RenderPropsOf, ToolCa
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import {
+  activeAgentCount,
   applySummary,
   buildSummaryPrompt,
   initialState,
@@ -146,7 +147,9 @@ test('band and pane render on terminal and desktop', async ($, on) => {
     expect(await band.find({ type: 'Text', text: /目的:/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /作業中/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /codex · bg 1 · jobs 1 · run-1 gpt-6-luna\/medium elapsed \d+ms \?t/ })).toBeDefined()
-    expect(await band.find({ type: 'Button', key: 'open-details' })).toBeDefined()
+    const detailButton = await band.find({ type: 'Button', key: 'open-details' })
+    expect(detailButton).toBeDefined()
+    expect(detailButton?.text).toContain('· 詳細')
 
     const pane = await $.ui.mount({
       plugin: PLUGIN,
@@ -1387,6 +1390,176 @@ test('subagent completion refreshes agent status without requesting a summary', 
   expect(modelCalls).toBe(0)
   expect(currentState()?.usage.calls).toBe(0)
   expect(currentState()?.agents.find(agent => agent.id === 'agent-finished')?.status).toBe('completed')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(0)
+})
+
+test('SubagentStop terminalizes stale listed agents and applies lifecycle when listing fails', async ($, on) => {
+  const clock = mock.clock(on)
+  const currentState = captureBriefState(on)
+  let listFails = false
+  on('classic.SubagentStop', () => ({}))
+  on('agent.list', () => {
+    if (listFails) throw new Error('agent list unavailable')
+    return { value: [{
+      id: 'stale-running-agent',
+      type: 'general-purpose',
+      description: 'stale status',
+      status: 'running',
+    }] }
+  })
+
+  await $.classic.SubagentStop({
+    session_id: 'session-subagent-stop',
+    transcript_path: '/tmp/session-subagent-stop.jsonl',
+    cwd: '/repo',
+    stop_hook_active: false,
+    agent_id: 'stale-running-agent',
+    agent_transcript_path: '/tmp/stale-running-agent.jsonl',
+    agent_type: 'general-purpose',
+    background_tasks: [],
+  })
+  await clock.settle()
+  expect(currentState()?.agents.find(agent => agent.id === 'stale-running-agent')?.status).toBe('completed')
+
+  listFails = true
+  await $.classic.SubagentStop({
+    session_id: 'session-subagent-stop',
+    transcript_path: '/tmp/session-subagent-stop.jsonl',
+    cwd: '/repo',
+    stop_hook_active: false,
+    agent_id: 'agent-stopped-without-list',
+    agent_transcript_path: '/tmp/agent-stopped-without-list.jsonl',
+    agent_type: 'general-purpose',
+    background_tasks: [],
+  })
+  await clock.settle()
+
+  expect(currentState()?.agents.find(agent => agent.id === 'agent-stopped-without-list')?.status).toBe('completed')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(0)
+})
+
+test('summary-excluded agents return when a later lifecycle event confirms them', async ($, on) => {
+  const clock = mock.clock(on)
+  const currentState = captureBriefState(on)
+  let completionStarted = false
+  const summaryAgent: AgentInfo = {
+    id: 'summary-created-agent',
+    type: 'general-purpose',
+    description: 'internal model agent',
+    status: 'running',
+  }
+  on('classic.SubagentStart', () => ({}))
+  on('agent.list', () => ({ value: completionStarted ? [summaryAgent] : [] }))
+  mockTurnOperations(on)
+  on('session.surfaces', () => ({ value: ['terminal'] }))
+  on('settings.read', () => ({ value: {} }))
+  on('ui.panes', () => ({ value: [] }))
+  on('model.complete', async () => {
+    completionStarted = true
+    return { value: answered(summaryText) }
+  })
+
+  await $.turn.start({ text: 'request', turnId: 'summary-created-agent-turn' })
+  await $.turn.complete(completeTurn('summary-created-agent-turn', 'answer'))
+  await clock.settle()
+
+  expect(currentState()?.agents.find(agent => agent.id === summaryAgent.id)).toBeUndefined()
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(0)
+
+  await $.classic.SubagentStart({
+    session_id: 'session-summary-created-agent',
+    transcript_path: '/tmp/session-summary-created-agent.jsonl',
+    cwd: '/repo',
+    agent_id: summaryAgent.id,
+    agent_type: summaryAgent.type,
+  })
+  await clock.settle()
+  expect(currentState()?.agents.find(agent => agent.id === summaryAgent.id)?.status).toBe('running')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(1)
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: abovePromptProps(),
+  })
+  expect(await band.find({ type: 'Text', text: /agents 1 running/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('Agent-tool subagent spawned during deferred summary stays visible until it completes', async ($, on) => {
+  const clock = mock.clock(on)
+  const currentState = captureBriefState(on)
+  const spawnedAgent: AgentInfo = {
+    id: 'agent-spawned-during-summary',
+    type: 'general-purpose',
+    description: 'user Agent-tool subagent',
+    status: 'running',
+  }
+  let listedAgents: AgentInfo[] = []
+  let modelStartedResolve: () => void = () => {}
+  const modelStarted = new Promise<void>(resolve => { modelStartedResolve = resolve })
+  let resolveModel: (result: ModelCompleteResult) => void = () => {}
+
+  mockTurnOperations(on)
+  on('agent.spawn', () => ({ model: 'haiku', agentId: spawnedAgent.id }))
+  on('agent.list', () => ({ value: listedAgents }))
+  on('session.surfaces', () => ({ value: ['terminal'] }))
+  on('settings.read', () => ({ value: {} }))
+  on('ui.panes', () => ({ value: [] }))
+  on('model.complete', async () => {
+    modelStartedResolve()
+    const result = await new Promise<ModelCompleteResult>(resolve => { resolveModel = resolve })
+    return { value: result }
+  })
+
+  await $.turn.start({ text: 'request', turnId: 'spawn-during-summary-turn' })
+  await $.turn.complete(completeTurn('spawn-during-summary-turn', 'answer'))
+  await clock.settle()
+  await modelStarted
+
+  listedAgents = [spawnedAgent]
+  await $.agent.spawn({
+    tool_use_id: 'agent-during-summary-tool-use',
+    prompt: 'inspect this task',
+    description: spawnedAgent.description,
+    subagentType: spawnedAgent.type,
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'sonnet',
+    background: false,
+    fork: false,
+  })
+  await clock.settle()
+
+  expect(currentState()?.agents.find(agent => agent.id === spawnedAgent.id)?.status).toBe('running')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(1)
+  const runningBand = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: abovePromptProps(),
+  })
+  expect(await runningBand.find({ type: 'Text', text: /agents 1 running/ })).toBeDefined()
+  await runningBand.unmount()
+
+  resolveModel(answered(summaryText))
+  await clock.settle()
+
+  expect(currentState()?.agents.find(agent => agent.id === spawnedAgent.id)?.status).toBe('running')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(1)
+
+  await $.turn.start({
+    text: 'agent request',
+    turnId: 'agent-tool-subagent-turn',
+    agentId: spawnedAgent.id,
+  })
+  await $.turn.complete({
+    ...completeTurn('agent-tool-subagent-turn', 'agent answer'),
+    agentId: spawnedAgent.id,
+  })
+  await clock.settle()
+  expect(currentState()?.agents.find(agent => agent.id === spawnedAgent.id)?.status).toBe('completed')
+  expect(activeAgentCount(currentState()?.agents ?? [])).toBe(0)
 })
 
 test('classic and tool call results are returned unchanged when state writes fail', async ($, on) => {
@@ -1446,6 +1619,7 @@ test('a reloaded main turn number starts after the persisted applied turn', asyn
   })
   on('session.surfaces', () => ({ value: ['terminal'] }))
   on('settings.read', () => ({ value: {} }))
+  on('agent.list', () => ({ value: [] }))
   let prompt = ''
   on('model.complete', async (_$, event) => {
     prompt = event.prompt
