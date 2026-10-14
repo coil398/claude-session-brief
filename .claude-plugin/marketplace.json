@@ -1,0 +1,12 @@
+{
+  "name": "claude-session-brief",
+  "owner": { "name": "coil398" },
+  "metadata": {
+    "description": "A concise Claude Code session handoff with background task and Codex job status."
+  },
+  "plugins": [{
+    "name": "session-brief",
+    "source": "./",
+    "description": "A concise handoff pane and live activity overview for Claude Code sessions."
+  }]
+}

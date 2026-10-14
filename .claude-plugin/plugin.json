@@ -1,0 +1,11 @@
+{
+  "name": "session-brief",
+  "version": "0.1.0",
+  "description": "Summarizes Claude Code sessions and tracks subagents, background tasks, hook activity, and Codex runner jobs.",
+  "author": {
+    "name": "coil398"
+  },
+  "repository": "https://github.com/coil398/claude-session-brief",
+  "homepage": "https://github.com/coil398/claude-session-brief",
+  "types": "./types/index.d.ts"
+}
