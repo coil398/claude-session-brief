@@ -6,6 +6,7 @@ import type {
   EngineInterface,
   Register,
   Timer,
+  UiPane,
 } from 'claude-code'
 import { createSerialLatestQueue } from './queue'
 import {
@@ -455,20 +456,43 @@ async function summarizeTurn(
   }
 }
 
-async function openPane($: EngineInterface): Promise<void> {
-  const existing = await $.ui.panes()
-  if (existing.some(pane => pane.id === PANE_ID)) return
-  await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
+function isPaneVisible(pane: UiPane | undefined): boolean {
+  return pane?.isShown === true && pane.isPlaced
 }
 
-async function togglePane($: EngineInterface): Promise<boolean> {
-  const existing = await $.ui.panes()
-  if (existing.some(pane => pane.id === PANE_ID)) {
+async function openPane(
+  $: EngineInterface,
+  existingPanes?: readonly UiPane[],
+): Promise<void> {
+  const existing = existingPanes ?? await $.ui.panes()
+  const current = existing.find(pane => pane.id === PANE_ID)
+  if (isPaneVisible(current)) return
+
+  await $.ui.open({ id: PANE_ID, title: PANE_TITLE, focus: true })
+  if (!current) return
+
+  const afterOpen = await $.ui.panes()
+  if (!isPaneVisible(afterOpen.find(pane => pane.id === PANE_ID))) {
+    safeDebug($, 'Session Brief is not visible after focus request; retrying close and open once')
     await $.ui.close({ id: PANE_ID })
-    return false
+    await $.ui.open({ id: PANE_ID, title: PANE_TITLE, focus: true })
+    const afterRetry = await $.ui.panes()
+    if (!isPaneVisible(afterRetry.find(pane => pane.id === PANE_ID))) {
+      safeDebug($, 'Session Brief is not visible after one focus retry')
+      throw new Error('Session Brief is not visible after one focus retry')
+    }
   }
-  await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
-  return true
+}
+
+async function togglePane($: EngineInterface): Promise<'opened' | 'closed' | 'foreground'> {
+  const existing = await $.ui.panes()
+  const current = existing.find(pane => pane.id === PANE_ID)
+  if (isPaneVisible(current)) {
+    await $.ui.close({ id: PANE_ID })
+    return 'closed'
+  }
+  await openPane($, existing)
+  return current ? 'foreground' : 'opened'
 }
 
 function formatAgentElapsed(agent: SessionBriefState['agents'][number], now: number): string {
@@ -1187,7 +1211,7 @@ export const register: Register = on => {
     const isCurrent = () => generation === sessionGeneration
     await ensureCodexMonitor($, isCurrent, codexMonitor)
     try {
-      await $.command.register({ name: 'brief', description: 'セッション概要を開閉します' })
+      await $.command.register({ name: 'brief', description: 'セッション概要を表示・閉じます' })
     } catch (error) {
       safeDebug($, `the brief command could not be registered: ${String(error)}`)
     }
@@ -1201,8 +1225,10 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'brief' }, async $ => {
-    const opened = await togglePane($)
-    return { text: opened ? 'セッション概要を開きました。' : 'セッション概要を閉じました。' }
+    const action = await togglePane($)
+    if (action === 'closed') return { text: 'セッション概要を閉じました。' }
+    if (action === 'foreground') return { text: 'セッション概要を前面に表示しました。' }
+    return { text: 'セッション概要を開きました。' }
   }).catch($ => {
     safeDebug($, 'the brief command could not open or close its pane')
     return { text: 'セッション概要を切り替えられませんでした。' }
@@ -1597,9 +1623,9 @@ export const register: Register = on => {
       safeDebug($, `could not read session brief state for the prompt band: ${String(error)}`)
       return next(e)
     }
-    let paneOpen: boolean
+    let paneVisible: boolean
     try {
-      paneOpen = (await $.ui.panes()).some(pane => pane.id === PANE_ID)
+      paneVisible = (await $.ui.panes()).some(pane => pane.id === PANE_ID && isPaneVisible(pane))
     } catch (error) {
       safeDebug($, `could not read open panes for the prompt band: ${String(error)}`)
       return next(e)
@@ -1612,7 +1638,7 @@ export const register: Register = on => {
       state.codexJobs.length > 0 ||
       hookStats.length > 0 ||
       state.usage.calls > 0
-    if (!hasData || paneOpen) return next(e)
+    if (!hasData || paneVisible) return next(e)
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const columns = e.props.bodyColumns
@@ -1678,7 +1704,7 @@ export const register: Register = on => {
           <Text size="heading" weight="semibold">セッション概要</Text>
           <Button
             key="close-brief"
-            label="閉じる"
+            label=" · 閉じる"
             plain
             onPress={() => $.ui.close({ id: PANE_ID })}
           />

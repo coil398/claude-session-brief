@@ -81,6 +81,15 @@ function paneProps(): RenderPropsOf['Pane'] {
   }
 }
 
+function runBrief($: Engine) {
+  return $.command.run({
+    command: 'brief',
+    args: '',
+    origin: { kind: 'plugin', name: PLUGIN },
+    presentation: { isFullscreen: true, columns: 200 },
+  })
+}
+
 function isCodexArtifactPath(path: string): boolean {
   return path.endsWith('-events.jsonl') ||
     path.endsWith('-err.txt') ||
@@ -158,6 +167,8 @@ test('band and pane render on terminal and desktop', async ($, on) => {
       requestId: PANE_ID,
       props: paneProps(),
     })
+    const closeButton = await pane.find({ type: 'Button', key: 'close-brief' })
+    expect(closeButton?.text).toContain('· 閉じる')
     expect(await pane.find({ type: 'Text', text: /完了（最新5）/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /決定（最新5）/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /あなた待ち（最新5）/ })).toBeDefined()
@@ -169,6 +180,286 @@ test('band and pane render on terminal and desktop', async ($, on) => {
     await pane.unmount()
     await band.unmount()
   }
+})
+
+test('/brief closes a visible pane, foregrounds a hidden pane, and opens a missing pane', async ($, on) => {
+  const clock = mock.clock(on)
+  const paneRows: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean }[] = []
+  const openRequests: { id: string; focus: true | undefined }[] = []
+  const closeRequests: string[] = []
+  let engineDiffOpen = true
+  let engineDiffShown = true
+  on('session.start', (_$, event) => ({ cwd: event.cwd }))
+  on('ui.panes', () => ({ value: paneRows }))
+  on('ui.open', (_$, event) => {
+    openRequests.push({ id: event.id, focus: event.focus })
+    if (event.id === PANE_ID) {
+      engineDiffShown = false
+      paneRows.splice(0, paneRows.length, {
+        id: PANE_ID,
+        title: event.title ?? 'Session Brief',
+        isShown: true,
+        isFocused: false,
+        isPlaced: true,
+      })
+    }
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, event) => {
+    closeRequests.push(event.id)
+    if (event.id === PANE_ID) {
+      paneRows.splice(0, paneRows.length)
+      engineDiffShown = engineDiffOpen
+    } else {
+      engineDiffOpen = false
+      engineDiffShown = false
+    }
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+
+  paneRows.push({
+    id: PANE_ID,
+    title: 'Session Brief',
+    isShown: false,
+    isFocused: false,
+    isPlaced: true,
+  })
+  const foreground = await runBrief($)
+  expect(foreground.text).toBe('セッション概要を前面に表示しました。')
+  expect(openRequests).toEqual([{ id: PANE_ID, focus: true }])
+  expect(closeRequests).toEqual([])
+  expect(engineDiffOpen).toBe(true)
+  expect(engineDiffShown).toBe(false)
+  expect(paneRows[0]?.isShown).toBe(true)
+
+  const closed = await runBrief($)
+  expect(closed.text).toBe('セッション概要を閉じました。')
+  expect(closeRequests).toEqual([PANE_ID])
+  expect(engineDiffShown).toBe(true)
+
+  const opened = await runBrief($)
+  expect(opened.text).toBe('セッション概要を開きました。')
+  expect(openRequests).toEqual([
+    { id: PANE_ID, focus: true },
+    { id: PANE_ID, focus: true },
+  ])
+  expect(closeRequests).toEqual([PANE_ID])
+  expect(engineDiffOpen).toBe(true)
+  expect(engineDiffShown).toBe(false)
+})
+
+test('the band remains visible while engine /diff is shown on terminal and desktop', async ($, on) => {
+  const clock = mock.clock(on)
+  let paneShown = false
+  let panePlaced = true
+  on('tool.call', () => ({ result: 'started' }))
+  on('ui.panes', () => ({
+    value: [{
+      id: PANE_ID,
+      title: 'Session Brief',
+      isShown: paneShown,
+      isFocused: false,
+      isPlaced: panePlaced,
+    }],
+  }))
+  on('ui.render', ($$, e) => {
+    const { Text } = $$.ui.resolve(e)
+    return <Text>prompt band fallback</Text>
+  })
+  await $.tool.call({ tool: 'Bash', command: 'echo show the prompt band', run_in_background: true })
+  await clock.settle()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const state of [
+      { shown: false, placed: true, bandVisible: true },
+      { shown: true, placed: false, bandVisible: true },
+      { shown: true, placed: true, bandVisible: false },
+    ]) {
+      paneShown = state.shown
+      panePlaced = state.placed
+      const band = await $.ui.mount({
+        plugin: PLUGIN,
+        surface,
+        component: 'AbovePrompt',
+        props: abovePromptProps(),
+      })
+      const details = await band.find({ type: 'Button', key: 'open-details' })
+      if (state.bandVisible) expect(details).toBeDefined()
+      else expect(details).toBeUndefined()
+      await band.unmount()
+    }
+  }
+})
+
+test('the band detail button foregrounds a hidden pane on both surfaces without closing panes', async ($, on) => {
+  const clock = mock.clock(on)
+  const paneRows: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean }[] = []
+  const openRequests: { id: string; focus: true | undefined }[] = []
+  const closeRequests: string[] = []
+  let engineDiffOpen = true
+  let engineDiffShown = true
+  on('tool.call', () => ({ result: 'started' }))
+  on('ui.panes', () => ({ value: paneRows }))
+  on('ui.open', (_$, event) => {
+    openRequests.push({ id: event.id, focus: event.focus })
+    if (event.id === PANE_ID) {
+      engineDiffShown = false
+      paneRows.splice(0, paneRows.length, {
+        id: PANE_ID,
+        title: event.title ?? 'Session Brief',
+        isShown: true,
+        isFocused: false,
+        isPlaced: true,
+      })
+    }
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, event) => {
+    closeRequests.push(event.id)
+    if (event.id === PANE_ID) engineDiffShown = engineDiffOpen
+    else {
+      engineDiffOpen = false
+      engineDiffShown = false
+    }
+    return { value: undefined }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'echo show the prompt band', run_in_background: true })
+  await clock.settle()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    engineDiffOpen = true
+    engineDiffShown = true
+    paneRows.splice(0, paneRows.length, {
+      id: PANE_ID,
+      title: 'Session Brief',
+      isShown: false,
+      isFocused: false,
+      isPlaced: true,
+    })
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: 'AbovePrompt',
+      props: abovePromptProps(),
+    })
+    expect(await band.press({ key: 'open-details' })).toEqual({ element: 'open-details' })
+    expect(openRequests[openRequests.length - 1]).toEqual({ id: PANE_ID, focus: true })
+    expect(closeRequests.every(id => id === PANE_ID)).toBe(true)
+    expect(closeRequests).toEqual([])
+    expect(engineDiffOpen).toBe(true)
+    expect(engineDiffShown).toBe(false)
+    expect(paneRows[0]?.isShown).toBe(true)
+    await band.unmount()
+  }
+})
+
+test('the band detail button retries a refused focus request once and preserves other panes', async ($, on) => {
+  const clock = mock.clock(on)
+  const paneRows: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean }[] = []
+  const openRequests: { id: string; focus: true | undefined }[] = []
+  const closeRequests: string[] = []
+  let engineDiffOpen = true
+  let engineDiffShown = true
+  let briefOpenCount = 0
+  on('tool.call', () => ({ result: 'started' }))
+  on('ui.panes', () => ({ value: paneRows }))
+  on('ui.open', (_$, event) => {
+    openRequests.push({ id: event.id, focus: event.focus })
+    if (event.id === PANE_ID && ++briefOpenCount === 2) {
+      engineDiffShown = false
+      paneRows.splice(0, paneRows.length, {
+        id: PANE_ID,
+        title: event.title ?? 'Session Brief',
+        isShown: true,
+        isFocused: false,
+        isPlaced: true,
+      })
+    }
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_$, event) => {
+    closeRequests.push(event.id)
+    if (event.id === PANE_ID) paneRows.splice(0, paneRows.length)
+    else {
+      engineDiffOpen = false
+      engineDiffShown = false
+    }
+    return { value: undefined }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'echo show the prompt band', run_in_background: true })
+  await clock.settle()
+  paneRows.push({
+    id: PANE_ID,
+    title: 'Session Brief',
+    isShown: false,
+    isFocused: false,
+    isPlaced: true,
+  })
+
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: abovePromptProps(),
+  })
+  expect(await band.press({ key: 'open-details' })).toEqual({ element: 'open-details' })
+  expect(openRequests).toEqual([
+    { id: PANE_ID, focus: true },
+    { id: PANE_ID, focus: true },
+  ])
+  expect(closeRequests).toEqual([PANE_ID])
+  expect(closeRequests.every(id => id === PANE_ID)).toBe(true)
+  expect(engineDiffOpen).toBe(true)
+  expect(engineDiffShown).toBe(false)
+  expect(paneRows[0]?.isShown).toBe(true)
+  await band.unmount()
+})
+
+test('/brief reports failure when a pane stays unplaced after the focus retry', async ($, on) => {
+  const clock = mock.clock(on)
+  const paneRows: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean }[] = [{
+    id: PANE_ID,
+    title: 'Session Brief',
+    isShown: false,
+    isFocused: false,
+    isPlaced: false,
+  }]
+  const openRequests: { id: string; focus: true | undefined }[] = []
+  const closeRequests: string[] = []
+  on('session.start', (_$, event) => ({ cwd: event.cwd }))
+  on('ui.panes', () => ({ value: paneRows }))
+  on('ui.open', (_$, event) => {
+    openRequests.push({ id: event.id, focus: event.focus })
+    if (event.id === PANE_ID) {
+      paneRows.splice(0, paneRows.length, {
+        id: PANE_ID,
+        title: event.title ?? 'Session Brief',
+        isShown: true,
+        isFocused: false,
+        isPlaced: false,
+      })
+    }
+    return { value: { isPlaced: false, reason: 'narrow terminal' } }
+  })
+  on('ui.close', (_$, event) => {
+    closeRequests.push(event.id)
+    if (event.id === PANE_ID) paneRows.splice(0, paneRows.length)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+
+  const failed = await runBrief($)
+  expect(failed.text).toBe('セッション概要を切り替えられませんでした。')
+  expect(openRequests).toEqual([
+    { id: PANE_ID, focus: true },
+    { id: PANE_ID, focus: true },
+  ])
+  expect(closeRequests).toEqual([PANE_ID])
+  expect(paneRows[0]?.isShown).toBe(true)
+  expect(paneRows[0]?.isPlaced).toBe(false)
 })
 
 test('long background and Codex values keep state and completion metadata visible', async ($, on) => {
